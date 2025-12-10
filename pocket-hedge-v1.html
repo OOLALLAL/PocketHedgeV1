@@ -1,0 +1,466 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Pocket Hedge v1 – Portfolio Analyzer</title>
+    <script src="https://code.jquery.com/jquery-3.7.1.min.js"></script>
+    <style>
+        * { box-sizing: border-box; }
+        body {
+            font-family: ui-sans-serif, system-ui;
+            margin: 0;
+            min-height: 100vh;
+            display: grid;
+            place-items: start center;
+            background: #f8fafc;
+        }
+        .container {
+            width: min(900px, 92vw);
+            margin-top: 28px;
+        }
+        h2 {
+            margin: 0 0 16px;
+            text-align: center;
+            color: #0f172a;
+        }
+        .toolbar {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 10px;
+            justify-content: center;
+            align-items: center;
+            padding: 14px;
+            background: #ffffff;
+            border: 1px solid #e2e8f0;
+            border-radius: 12px;
+            box-shadow: 0 6px 20px rgba(15, 23, 42, 0.06);
+        }
+        .toolbar input,
+        .toolbar select,
+        .toolbar button {
+            height: 42px;
+            padding: 8px 12px;
+            font-size: 14px;
+            border: 1px solid #e2e8f0;
+            border-radius: 10px;
+            background: #fff;
+            outline: none;
+        }
+        .toolbar input { width: min(520px, 80vw); }
+        .toolbar select { width: 260px; }
+        .toolbar button {
+            background: #1d4ed8;
+            color: #fff;
+            cursor: pointer;
+            border-color: #1d4ed8;
+        }
+        .toolbar button#resetBench {
+            background: #fff;
+            color: #0f172a;
+            border-color: #e2e8f0;
+        }
+        #status {
+            margin: 14px 0 8px;
+            text-align: center;
+            color: #475569;
+        }
+        pre {
+            background: #0f172a;
+            color: #e2e0f0;
+            padding: 14px;
+            border-radius: 10px;
+            white-space: pre-wrap;
+            border: 1px solid #0b1220;
+        }
+        .toolbar input:focus,
+        .toolbar select:focus,
+        .toolbar button:focus {
+            box-shadow: 0 0 0 3px rgba(59, 130, 246, .25);
+            border-color: #93c5fd;
+        }
+        @media (max-width: 640px) {
+            .toolbar input,
+            .toolbar select { width: 100%; }
+        }
+    </style>
+</head>
+
+<body>
+    <div class="container">
+        <h2>Portfolio Analyzer</h2>
+
+        <div class="toolbar">
+            <input id="symbolInput" placeholder="Ticker (e.g., TSLA, AAPL)" style="width:280px" />
+            <input id="weightInput" placeholder="Weight % (e.g., 20)" type="number" style="width:160px" />
+            <select id="benchmarks">
+                <option value="" selected disabled hidden>Select a benchmark</option>
+                <option value="QQQ">QQQ (NASDAQ)</option>
+                <option value="SPY">SPY (S&P 500)</option>
+                <option value="DIA">DIA (Dow Jones)</option>
+            </select>
+            <button id="addBtn">Add</button>
+            <button id="analyseBtn">Analyze portfolio</button>
+            <button id="resetBench">Clear benchmark cache</button>
+        </div>
+
+        <div id="PortfolioLog">
+            <table id="pfTable">
+                <thead>
+                    <tr>
+                        <th>Symbol</th>
+                        <th>Weight</th>
+                        <th></th>
+                    </tr>
+                </thead>
+                <tbody></tbody>
+                <tfoot>
+                    <tr>
+                        <td>Total</td>
+                        <td id="sumCell">0%</td>
+                        <td></td>
+                    </tr>
+                </tfoot>
+            </table>
+        </div>
+
+        <div id="status">Checking benchmark cache…</div>
+        <pre id="log"></pre>
+    </div>
+
+    <script>
+        // [1] Utils
+        function toStooq(sym) {
+            sym = (sym || '').trim();
+            if (!sym) return '';
+            if (sym.includes('.')) return sym.toLowerCase();
+            return sym.toLowerCase() + ".us";
+        }
+        function stooqUrl(stooqSymbol) {
+            return `https://r.jina.ai/http://stooq.com/q/d/l/?s=${stooqSymbol}&i=d`;
+        }
+
+        // [2] Network
+        async function getFetchDataWithRetry(sym, tries = 2, delayMs = 300) {
+            for (let t = 0; t < tries; t++) {
+                try {
+                    return await getFetchData(sym);
+                } catch (error) {
+                    if (t < tries - 1) await new Promise(r => setTimeout(r, delayMs));
+                    else throw error;
+                }
+            }
+        }
+
+        async function getFetchData(sym) {
+            const res = await fetch(stooqUrl(toStooq(sym)));
+            if (!res.ok) throw new Error(`Failed to fetch data for ${sym} (HTTP ${res.status}).`);
+
+            const txt = await res.text();
+            const lines = txt.trim().split(/\r?\n/).slice(6);
+            if (!lines.length) throw new Error(`No data available for ${sym}.`);
+
+            const dateAndClose = lines
+                .map(line => {
+                    const [date, , , , close] = line.split(',');
+                    return { date, close: Number(close) };
+                })
+                .filter(el => Number.isFinite(el.close));
+
+            if (dateAndClose.length < 3) {
+                throw new Error(`${sym} has too few data points for analysis.`);
+            }
+            return dateAndClose;
+        }
+
+        // [3] Statistics
+        function mean(a) {
+            return a.reduce((s, x) => s + x, 0) / a.length;
+        }
+        function stdev(a) {
+            if (a.length < 2) throw new Error('Not enough samples for stdev.');
+            const m = mean(a);
+            return Math.sqrt(a.reduce((s, x) => s + (x - m) * (x - m), 0) / (a.length - 1));
+        }
+        function covariance(a, b) {
+            const n = Math.min(a.length, b.length);
+            if (n < 2) throw new Error('Not enough samples for covariance.');
+            const ma = mean(a);
+            const mb = mean(b);
+            let s = 0;
+            for (let i = 0; i < n; i++) {
+                s += (a[i] - ma) * (b[i] - mb);
+            }
+            return s / (n - 1);
+        }
+
+        function histVaR(RA, alpha) {
+            const sorted = [...RA].sort((x, y) => x - y);
+            const n = sorted.length;
+            if (n < 100) {
+                $('#status').text(`Only ${n} samples – VaR estimate may be noisy.`);
+            }
+            const idx = Math.floor(n * (1 - alpha));
+            const value = sorted[Math.max(0, Math.min(idx, n - 1))];
+            return Math.abs(value);
+        }
+
+        // [4] Transform
+        function getLogReturn(dateAndClose) {
+            const date = dateAndClose.map(el => el.date).slice(1);
+            const price = dateAndClose.map(el => Number(el.close));
+            const r = [];
+            for (let i = 0; i < price.length - 1; i++) {
+                r[i] = Math.log(price[i + 1] / price[i]);
+            }
+            return { date, r };
+        }
+
+        // [5] Benchmarks & cache
+        const LOCAL_STORAGE_KEY = 'bench@v1';
+        const BENCH_KEY = {
+            'bench@qqq': 'QQQ',
+            'bench@spy': 'SPY',
+            'bench@dia': 'DIA'
+        };
+
+        function saveBenchAtCache(out) {
+            localStorage.setItem(LOCAL_STORAGE_KEY, JSON.stringify({ savedAt: Date.now(), data: out }));
+        }
+
+        async function makeBenchData() {
+            const out = {};
+            for (const key in BENCH_KEY) {
+                const symbol = BENCH_KEY[key];
+                const dateAndClose = await getFetchDataWithRetry(symbol);
+                const { date, r } = getLogReturn(dateAndClose);
+                out[symbol] = { date, r };
+            }
+            return out;
+        }
+
+        const BENCH_TTL_MS = 24 * 60 * 60 * 1000;
+        function getBenchFromCache() {
+            const benchData = JSON.parse(localStorage.getItem(LOCAL_STORAGE_KEY));
+            if (!benchData) return null;
+            if (Date.now() - benchData.savedAt > BENCH_TTL_MS) return null;
+            return benchData.data;
+        }
+
+        let cachedBenchData = null;
+        async function setBench() {
+            try {
+                cachedBenchData = getBenchFromCache();
+                if (!cachedBenchData) {
+                    $("#status").text('Preparing benchmark data...');
+                    const newBenchData = await makeBenchData();
+                    saveBenchAtCache(newBenchData);
+                    cachedBenchData = getBenchFromCache();
+                }
+                $("#status").text('Benchmark ready.');
+            } catch (error) {
+                $('#status').text('Failed to prepare benchmark: ' + error.message);
+            }
+        }
+
+        // [6] UI & inputs
+        let sumCell = 0;
+        function addTable() {
+            const symI = $("#symbolInput").val().trim().toUpperCase();
+            if (!symI) {
+                alert("Please enter a symbol.");
+                return;
+            }
+
+            let isDuplicated = false;
+            $('tbody').find('.symVal').each(function () {
+                if ($(this).text() === symI) {
+                    isDuplicated = true;
+                    return false;
+                }
+            });
+            if (isDuplicated) {
+                alert("This symbol is already in the portfolio.");
+                return;
+            }
+
+            const wgtI = Number($("#weightInput").val().trim());
+            if (!Number.isFinite(wgtI) || wgtI <= 0) {
+                alert('Please enter a valid weight.');
+                return;
+            }
+            if (sumCell + wgtI > 100) {
+                alert(`Remaining weight is ${100 - sumCell}%.`);
+                return;
+            }
+
+            sumCell += wgtI;
+            $("tbody").append(
+                `<tr>
+                    <td class="symVal">${symI}</td>
+                    <td class="wgtVal">${wgtI}%</td>
+                    <td><button class="eraseBtn">Remove</button></td>
+                 </tr>`
+            );
+            $("#sumCell").text(sumCell + '%');
+        }
+
+        $("#addBtn").on('click', addTable);
+
+        $("tbody").on('click', '.eraseBtn', function () {
+            const $row = $(this).closest('tr');
+            const wgt = Number($row.find('.wgtVal').text().replace('%', ''));
+            sumCell -= wgt;
+            $row.remove();
+            $("#sumCell").text(sumCell + '%');
+        });
+
+        function getInputFromTable() {
+            const syms = [];
+            const wgts = [];
+            $('tbody').find('.symVal').each(function () {
+                syms.push($(this).text());
+            });
+            $('tbody').find('.wgtVal').each(function () {
+                wgts.push(Number($(this).text().replace('%', '')) / 100);
+            });
+            return { syms, wgts };
+        }
+
+        // [7] Portfolio logic
+        function getTotal(pfDRW, selectedBench) {
+            const pfWMap = pfDRW.map(({ date, r, w }) => ({
+                w: Number(w),
+                map: new Map(date.map((d, i) => [d, r[i]]))
+            }));
+
+            const pfD = [];
+            const Rp = [];
+            const RB = [];
+
+            const benchD = selectedBench.date;
+            const benchR = selectedBench.r;
+
+            for (let i = 0; i < benchD.length; i++) {
+                const d = benchD[i];
+                const rb = benchR[i];
+
+                let ok = true;
+                let sum = 0;
+                for (const { w, map } of pfWMap) {
+                    const r = map.get(d);
+                    if (r == null) {
+                        ok = false;
+                        break;
+                    }
+                    sum += r * w;
+                }
+                if (ok) {
+                    pfD.push(d);
+                    Rp.push(sum);
+                    RB.push(rb);
+                }
+            }
+            return { pfD, Rp, RB };
+        }
+
+        function getCumR(R) {
+            const L = R.length;
+            const out = new Array(L);
+            out[0] = R[0];
+            for (let i = 1; i < L; i++) {
+                out[i] = out[i - 1] + R[i];
+            }
+            return out;
+        }
+
+        function getIdxCumR(cumR) {
+            const L = cumR.length;
+            const out = new Array(L);
+            for (let i = 0; i < L; i++) {
+                out[i] = (Math.exp(cumR[i]) - 1) * 100;
+            }
+            return out;
+        }
+
+        let selectedBench = null;
+
+        async function portfolioCal() {
+            if (sumCell !== 100) {
+                alert('Total weight must be exactly 100%.');
+                return;
+            }
+            $('#status').text('Analyzing portfolio...');
+
+            try {
+                const benchSym = $("#benchmarks").val();
+                selectedBench = cachedBenchData[benchSym];
+                if (!selectedBench) throw new Error('No benchmark data loaded.');
+
+                const { syms, wgts } = getInputFromTable();
+                const pfDRW = [];
+
+                const dateAndCloses = await Promise.all(
+                    syms.map(s => getFetchDataWithRetry(s))
+                );
+
+                dateAndCloses.forEach((dc, i) => {
+                    const { date, r } = getLogReturn(dc);
+                    pfDRW.push({ date, r, w: Number(wgts[i]) });
+                });
+
+                const { pfD, Rp, RB } = getTotal(pfDRW, selectedBench);
+                if (Rp.length !== RB.length || Rp.length < 2) {
+                    throw new Error(`Not enough overlapping dates: RB=${RB.length}, Rp=${Rp.length}`);
+                }
+                if (RB.some(x => !Number.isFinite(x)) || Rp.some(x => !Number.isFinite(x))) {
+                    throw new Error('NaN/Infinity detected in return series.');
+                }
+
+                const sB = stdev(RB), sP = stdev(Rp);
+                if (!Number.isFinite(sB) || sB === 0) {
+                    throw new Error('Benchmark volatility is zero.');
+                }
+                const covPB = covariance(Rp, RB);
+
+                const betaP = covPB / (sB ** 2);
+                const corrP = (sP ? covPB / (sP * sB) : 0);
+                const var95P = histVaR(Rp, 0.95);
+                const volDailyP = sP;
+                const volAnnualP = volDailyP * Math.sqrt(252);
+
+                const portfolioMetrics = {
+                    beta: +betaP.toFixed(4),
+                    corr: +corrP.toFixed(4),
+                    volDaily: +volDailyP.toFixed(4),
+                    volAnnual: +volAnnualP.toFixed(4),
+                    var95_hist: +var95P.toFixed(4)
+                };
+
+                $('#status').text('Analysis complete.');
+                $('#log').text(JSON.stringify({ portfolioMetrics }, null, 2));
+
+                // cumulated returns prepared here if you later want to chart them:
+                const cumRB = getCumR(RB);
+                const cumRp = getCumR(Rp);
+                const cumIdxRB = getIdxCumR(cumRB);
+                const cumIdxRP = getIdxCumR(cumRp);
+
+            } catch (error) {
+                $('#status').text('Error: ' + error.message);
+                $('#log').text(String(error.stack || error));
+            }
+        }
+
+        $('#analyseBtn').on('click', portfolioCal);
+
+        $('#resetBench').on('click', () => {
+            localStorage.removeItem(LOCAL_STORAGE_KEY);
+            $('#status').text('Benchmark cache cleared. It will be rebuilt on next run.');
+        });
+
+        setBench();
+    </script>
+</body>
+</html>
